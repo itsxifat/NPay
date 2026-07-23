@@ -1,0 +1,141 @@
+// NPay — data model for automated bKash payment verification.
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// A merchant that receives payments.
+model User {
+  id           String         @id @default(cuid())
+  email        String         @unique
+  passwordHash String
+  name         String
+  businessName String?
+  createdAt    DateTime       @default(now())
+
+  accounts     BkashAccount[]
+  devices      Device[]
+  payments     PaymentRequest[]
+  apiKeys      ApiKey[]
+}
+
+// A bKash wallet the merchant receives money into. Balance is tracked
+// here and reconciled against every incoming SMS.
+model BkashAccount {
+  id             String        @id @default(cuid())
+  userId         String
+  user           User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  label          String        // e.g. "Main store wallet"
+  accountNumber  String        // the merchant's bKash number
+  // Balance in poisha (integer) to avoid floating point drift. 100 poisha = 1 Tk.
+  currentBalance Int           @default(0)
+  isActive       Boolean       @default(true)
+  createdAt      DateTime      @default(now())
+
+  devices        Device[]
+  transactions   Transaction[]
+  payments       PaymentRequest[]
+
+  @@unique([userId, accountNumber])
+}
+
+// A physical Android phone running the NPay SMS collector. Authenticates
+// SMS ingestion with a secret apiKey.
+model Device {
+  id             String        @id @default(cuid())
+  userId         String
+  user           User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  bkashAccountId String?
+  bkashAccount   BkashAccount? @relation(fields: [bkashAccountId], references: [id])
+  name           String
+  apiKey         String        @unique
+  isActive       Boolean       @default(true)
+  lastSeenAt     DateTime?
+  createdAt      DateTime      @default(now())
+
+  smsMessages    SmsMessage[]
+}
+
+// Raw log of every SMS the app forwards, kept for audit/debug.
+model SmsMessage {
+  id          String       @id @default(cuid())
+  deviceId    String
+  device      Device       @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  sender      String       // SMS originating address (e.g. "bKash")
+  body        String
+  receivedAt  DateTime     // when the phone received it
+  parsed      Boolean      @default(false)
+  parseError  String?
+  createdAt   DateTime     @default(now())
+
+  transaction Transaction?
+}
+
+// A parsed "received money" event on a bKash account.
+// status is one of: VERIFIED | UNRECONCILED | DUPLICATE
+// (SQLite has no native enums, so it is stored as a String.)
+model Transaction {
+  id             String            @id @default(cuid())
+  bkashAccountId String
+  bkashAccount   BkashAccount      @relation(fields: [bkashAccountId], references: [id], onDelete: Cascade)
+  smsMessageId   String?           @unique
+  smsMessage     SmsMessage?       @relation(fields: [smsMessageId], references: [id])
+
+  trxId          String            @unique
+  amount         Int               // poisha
+  fee            Int               @default(0)
+  senderPhone    String
+  balanceBefore  Int               // poisha, snapshot before applying
+  balanceAfter   Int               // poisha, as reported by SMS
+  status         String            @default("VERIFIED")
+  occurredAt     DateTime
+  createdAt      DateTime          @default(now())
+
+  payment        PaymentRequest?
+
+  @@index([bkashAccountId, senderPhone, amount])
+}
+
+// A payment the merchant is expecting / a checkout the payer completes.
+// status is one of: PENDING | COMPLETED | EXPIRED | CANCELLED
+model PaymentRequest {
+  id                  String        @id @default(cuid())
+  userId              String
+  user                User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  bkashAccountId      String
+  bkashAccount        BkashAccount  @relation(fields: [bkashAccountId], references: [id])
+
+  reference           String        @unique // public id used in checkout URL
+  orderId             String?       // merchant's own order id
+  amount              Int           // poisha, expected amount
+  expectedSenderPhone String?       // payer's bKash number, if known up front
+  customerName        String?
+  description         String?
+  callbackUrl         String?       // merchant webhook fired on completion
+
+  status              String        @default("PENDING")
+  matchedTxId         String?       @unique
+  matchedTx           Transaction?  @relation(fields: [matchedTxId], references: [id])
+  payerPhone          String?       // filled from the matched transaction
+  completedAt         DateTime?
+  expiresAt           DateTime
+  createdAt           DateTime      @default(now())
+
+  @@index([bkashAccountId, status, amount])
+}
+
+// Public/secret API key pair for the merchant integration API.
+model ApiKey {
+  id         String   @id @default(cuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  label      String
+  publicKey  String   @unique // pk_...
+  secretHash String   // bcrypt of sk_...
+  lastUsedAt DateTime?
+  createdAt  DateTime @default(now())
+}
